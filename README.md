@@ -135,7 +135,7 @@ y 向下）。点对 `a`、`b` 分别是边界点在 `fragment_a`、`fragment_b`
 仓库自带一个可直接生成真实请求并调用服务的脚本：
 
 ```bash
-# 1) 生成 examples/request.json（3 张透明 PNG：两片可拼合 + 一片孤立）
+# 1) 生成 examples/request.json（3 张半透明 PNG：两片可拼合 + 一片孤立）
 python examples/make_example.py
 
 # 2) 对正在运行的服务发起真实 POST，落地 examples/response.json 与渲染 PNG
@@ -364,6 +364,28 @@ curl -s -X POST http://localhost:8000/assemblies \
 的位姿与淘汰归属保持不变）；增广集合不可行时一律按实际失败项裁定，
 绝不报 `score_optimization_not_selected`。
 
+### 半透明 PNG 的颜色与 alpha（直通 RGB，不在中间步骤变暗）
+
+请求里的 PNG 是**直通（straight / non-premultiplied）BGRA**：例如一个
+`R=200、A=128` 的单片半透明陶片，颜色通道就是 200，不随 alpha 缩小。
+渲染管线在颜色表示上的约定是固定的：
+
+1. **实体掩膜与接缝重叠裁决只看 alpha>0**（最近邻、二值，不读 RGB），
+   与渲染完全解耦——半透明像素算实体，全透明像素不算；
+2. 每片在仿射采样（`INTER_LINEAR` 双线性）**之前**先转成
+   **预乘 RGBA**（`RGB·α`，全透明像素的隐藏 RGB 被清零），因此旋转边缘
+   的双线性插值等价于对覆盖率与预乘颜色分别加权，**不会被周围全透明
+   像素里残留的任意 RGB 污染**；
+3. 逐片合成在**预乘域**做标准 source-over：
+   `C = C_s + C_d·(1−α_s)`、`α = α_s + α_d·(1−α_s)`；
+4. 仅在最终编码 PNG 时做**一次**去预乘 `RGB = C/α`，写回直通 RGB。
+
+所以单片 `R=200、A=128` 输出仍是 `R=200、A=128`；两片同色半透明陶片
+叠层后 `A≈192、R=200`（alpha 正确累积而颜色不变暗）；全不透明画面
+逐像素保持原色与 `A=255`，完全透明区域为 `(0,0,0,0)`。早期实现把直通
+RGB 直接乘 alpha 写入 PNG（单片红通道约 100、叠层更暗），且在直通域
+插值导致旋转边缘混入透明像素的隐藏 RGB——上述管线修复了这两个问题。
+
 ---
 
 ## 5. 模块结构
@@ -373,7 +395,7 @@ app/
   geometry.py    闭式刚体（旋转+平移）拟合、位姿复合/相对位姿
   posegraph.py   生成树初始化 + 全局 Gauss–Newton 位姿图求解（所有接缝同时拟合）
   relax.py       位姿可行性的 LP 松弛（单调性、可靠剪枝；多分量块对角变量空间）
-  masks.py       alpha 掩膜、相对位姿下的实体重叠计数、透明 PNG 渲染
+  masks.py       alpha 掩膜、相对位姿下的实体重叠计数；预乘域仿射采样与 source-over 透明 PNG 渲染
   assembler.py   解码/建模、可行性判定、分支限界精确全局选缝
   service.py     端到端编排：成簇、采用/淘汰归因、渲染与响应
   schemas.py     Pydantic 请求/响应模型

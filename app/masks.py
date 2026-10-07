@@ -48,11 +48,31 @@ def _warped_corners(mask: np.ndarray, theta: float, t: np.ndarray):
     return pts @ R.T + np.asarray(t).ravel()
 
 
+def _premultiplied(img_bgra: np.ndarray) -> np.ndarray:
+    """Straight (non-premultiplied) BGRA uint8 -> premultiplied float64.
+
+    Returns ``(B*a, G*a, R*a, a)`` with colour channels scaled to 0..255
+    and coverage ``a`` in 0..1.  Premultiplying zeroes the RGB hidden in
+    fully transparent texels, so bilinear resampling at rotated edges can
+    never bleed that junk colour into partially covered pixels.
+    """
+    a = img_bgra[:, :, 3:4].astype(np.float64) / 255.0
+    prem = np.empty((*img_bgra.shape[:2], 4), dtype=np.float64)
+    prem[:, :, :3] = img_bgra[:, :, :3].astype(np.float64) * a
+    prem[:, :, 3:4] = a
+    return prem
+
+
 def render_cluster(images: dict, poses: dict, pad: int = 8) -> bytes:
     """Render all fragments in a cluster under one common pose to PNG bytes.
 
-    Images are RGBA.  Fragments are painted ordered by fragment id so
-    output is deterministic; alpha blending is standard source-over.
+    Decoded images are straight-alpha BGRA.  Resampling and source-over
+    compositing happen in *premultiplied* colour, where bilinear
+    interpolation and Porter-Duff "over" are both linear and exact: the
+    straight RGB of a single semi-transparent shard is preserved, stacked
+    shards blend without darkening, and rotated edges are not polluted by
+    the RGB hidden in fully transparent texels.  Straight RGB is written
+    back only once, when the final PNG is encoded.
     """
     ids = sorted(images)
     corners = []
@@ -71,24 +91,36 @@ def render_cluster(images: dict, poses: dict, pad: int = 8) -> bytes:
     x1 = int(np.ceil(allc[:, 0].max())) + pad
     y1 = int(np.ceil(allc[:, 1].max())) + pad
     W, H = x1 - x0, y1 - y0
-    canvas = np.zeros((H, W, 4), dtype=np.uint8)
+
+    # Accumulator kept in premultiplied float: channels B,G,R are
+    # premultiplied colour (0..255), channel A is coverage (0..1).
+    acc = np.zeros((H, W, 4), dtype=np.float64)
 
     for fid in ids:
         theta, t = poses[fid]
         A = _affine(theta, t + np.array([-x0, -y0]))
         warped = cv2.warpAffine(
-            images[fid], A, (W, H),
+            _premultiplied(images[fid]), A, (W, H),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
+            borderValue=(0.0, 0.0, 0.0, 0.0),
         )
-        alpha = warped[:, :, 3:4].astype(np.float64) / 255.0
-        base_rgb = canvas[:, :, :3].astype(np.float64)
-        base_a = canvas[:, :, 3:4].astype(np.float64) / 255.0
-        out_rgb = warped[:, :, :3].astype(np.float64) * alpha + base_rgb * (1 - alpha) * base_a
-        out_a = alpha + (1 - alpha) * base_a
-        canvas[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-        canvas[:, :, 3] = np.clip(out_a[:, :, 0] * 255.0, 0, 255).astype(np.uint8)
+        src_rgb, src_a = warped[:, :, :3], warped[:, :, 3:4]
+        # Premultiplied source-over: co = cs + cb*(1-as),
+        # ao = as + ab*(1-as).
+        inv_a = 1.0 - src_a
+        acc[:, :, :3] = src_rgb + acc[:, :, :3] * inv_a
+        acc[:, :, 3:4] = src_a + acc[:, :, 3:4] * inv_a
+
+    # Convert back to straight-alpha BGRA exactly once, on encoding.
+    coverage = acc[:, :, 3:4]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        straight_rgb = acc[:, :, :3] / coverage
+    straight_rgb = np.where(coverage > 1e-12, straight_rgb, 0.0)
+    canvas = np.empty((H, W, 4), dtype=np.uint8)
+    canvas[:, :, :3] = np.clip(np.rint(straight_rgb), 0, 255).astype(np.uint8)
+    canvas[:, :, 3] = np.clip(np.rint(coverage[:, :, 0] * 255.0),
+                              0, 255).astype(np.uint8)
 
     ok, buf = cv2.imencode(".png", canvas)
     if not ok:

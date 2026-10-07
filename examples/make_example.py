@@ -27,11 +27,18 @@ def png_b64(img_bgra: np.ndarray) -> str:
 
 
 def make_pieces(size=160):
-    """Two irregular shards from one plaque along a wavy cut + one isolated."""
+    """Two irregular shards from one plaque along a wavy cut + one isolated.
+
+    The plaque is deliberately *semi-transparent* (straight alpha 180/255)
+    so the rendered response exercises the alpha pipeline: each shard keeps
+    its straight RGB and alpha after the affine warp instead of coming back
+    darkened (a straight-RGB-times-alpha bug would dim R 178 to ~126).
+    Two-layer source-over blending is covered by the test suite.
+    """
     H = W = size
     plaque = np.zeros((H, W, 4), np.uint8)
     plaque[:, :, :3] = (82, 120, 178)    # terracotta (B, G, R)
-    plaque[:, :, 3] = 255
+    plaque[:, :, 3] = 180                # semi-transparent, straight alpha
 
     ys = np.arange(H, dtype=np.float64)
     cut = (W / 2
@@ -66,9 +73,9 @@ def make_pieces(size=160):
         pb = [float(cut[y] - bx0), float(y - by0)]
         pairs.append({"a": pa, "b": pb})
 
-    # Isolated third fragment (a small rounded tile).
+    # Isolated third fragment (a small rounded tile), also semi-transparent.
     iso = np.zeros((46, 46, 4), np.uint8)
-    cv2.circle(iso, (23, 23), 20, (60, 110, 190, 255), -1)
+    cv2.circle(iso, (23, 23), 20, (60, 110, 190, 200), -1)
 
     return imgA, imgB, iso, pairs
 
